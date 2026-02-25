@@ -1,0 +1,322 @@
+-- SCP-939 Code for Roblox
+-- Made by AFredAthe2nd (luish2817 on discord)
+-- Disclaimer: This is a little choppy (mainly on the pathfinding), might make it better some other time
+
+-- CAN USE, LEAVE CREDIT THOUGH!
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local PathfindingService = game:GetService("PathfindingService")
+
+local RedDog = game.Workspace:WaitForChild("SCP-939")
+local DogHumanoid = RedDog:WaitForChild("Humanoid")
+local Primary = RedDog.PrimaryPart or RedDog:WaitForChild("HumanoidRootPart")
+local Animator = DogHumanoid:WaitForChild("Animator")
+
+local Event = ReplicatedStorage:WaitForChild("ChangeState")
+local SetWaypoints = game.Workspace:WaitForChild("Waypoints") -- wtv u name it, set waypoints for it to patrol
+
+local RunRadius = 50
+local WalkRadius = 30
+local CrouchRadius = 10
+local Crouch2 = 5
+
+local Tick = 0.5
+local currentTarget = nil
+
+local SetAgentHeight = 5
+local SetAgentCanJump = false
+local SetAgentCanClimb = false
+local SetAgentRadius = 2
+
+local Targetting = false
+local Breached = false
+
+local State = {}
+
+local LastClientPing = {}
+
+local Ranges = {}
+
+local Animations = {
+	"" -- put animations here!!! (make sure to put comma after each one ie. ("Walk", "Run", etc..)
+}
+
+local LoadedAnims = {}
+
+local function LoadAnimations()
+	local Folder = RedDog:WaitForChild("Anims")
+	if not Folder then
+		warn("Animation folder not found.")
+	end
+	
+	for _, Anim in ipairs(Animations) do
+		local Animation = Folder:FindFirstChild(Anim)
+		if Animation and Animation:IsA("Animation") then
+			LoadedAnims[Anim] = Animator:LoadAnimation(Animation)
+		else
+			warn("cant find animation " ..Anim)
+		end
+	end
+end
+
+LoadAnimations()
+
+local function RateLimit(plr, cooldown)
+	LastClientPing[plr] = os.clock()
+	local t = os.clock()
+	local last = LastClientPing[plr]
+	if t - last < cooldown then
+		return false
+	end
+	LastClientPing[plr] = t
+	return true
+end
+
+local function SmoothPathing(plr) -- copied from 106 (didnt feel like remaking)
+	if not plr then return end
+	local plrChar = plr.Character
+	local plrHRP = plrChar:FindFirstChild("HumanoidRootPart")
+	if not plrHRP then return end
+
+	local RepathInterval = 0.75 -- how often to recompute path
+	local WaypointReachedDist = 3 -- how close waypoint reach
+	local stuckTime = 1.25 -- how long it takes to recompute if stuck
+	local GiveUpMoveDist = 0.15 -- not moving threshold per step
+	local Look = 1 -- waypoint index
+
+	local lastRepath = 0
+	local path = nil
+	local waypoints = nil
+	local wpIndex = 1
+
+	local lastPos = Primary.Position
+	local StuckFor = 0
+
+	local function computePath()	
+		local newPath = PathfindingService:CreatePath({
+			AgentRadius = SetAgentRadius,
+			AgentHeight = SetAgentHeight,
+			AgentCanJump = SetAgentCanJump,
+			AgentCanClimb = SetAgentCanClimb
+		})
+
+		local ok, error = pcall(function()
+			newPath:ComputeAsync(Primary.Position, plrHRP.Position)
+		end)
+
+		if not ok or newPath.Status ~= Enum.PathStatus.Success then
+			path = nil
+			waypoints = nil
+			wpIndex = 1
+			return
+		end
+
+		path = newPath
+		waypoints = newPath:GetWaypoints()
+		wpIndex = 1
+	end
+
+	computePath()
+	lastRepath = os.clock()
+
+	while Breached do
+		plrChar = plr.Character
+		if not plrChar then break end
+
+		plrHRP = plrChar:FindFirstChild("HumanoidRootPart")
+		if not plrHRP then break end
+
+		local now = os.clock()
+		if (not waypoints) or (now - lastRepath) >= RepathInterval then
+			computePath()
+			lastRepath = now
+		end
+
+		if waypoints and waypoints[wpIndex] then
+			local targetIdx = math.clamp(wpIndex + Look, 1, #waypoints)
+			local targetPos = waypoints[targetIdx].Position
+			local curPos = Primary.Position
+			local curWPpos = waypoints[wpIndex].Position
+
+			if (curWPpos - curPos).Magnitude <= WaypointReachedDist then
+				wpIndex += 1
+				if wpIndex > #waypoints then
+					wpIndex = #waypoints
+				end
+			end
+
+			DogHumanoid:MoveTo(targetPos)
+		else
+			DogHumanoid:MoveTo(plrHRP.Position)
+		end
+
+		local moved = (Primary.Position - lastPos).Magnitude
+		lastPos = Primary.Position
+
+		if moved <= GiveUpMoveDist then
+			StuckFor += 0.1
+			if StuckFor >= stuckTime then
+				computePath()
+				lastRepath = os.clock()
+				StuckFor = 0
+			end
+		else
+			StuckFor = 0
+		end
+		task.wait(0.1)
+	end
+end
+
+local function PatrolWaypoints()
+	if not DogHumanoid or not SetWaypoints then return end
+	for _, i in ipairs(SetWaypoints:GetChildren()) do
+		if i:IsA("BasePart") then
+			DogHumanoid:MoveTo(i.Position)
+			DogHumanoid.MoveToFinished:Wait()
+		end
+	end
+end
+
+local function GetDistance(plr)
+	local plrChar = plr.Character
+	if not plrChar then return nil end
+	local plrHRP = plrChar:FindFirstChild("HumanoidRootPart")
+	if not plrHRP then return nil end
+	
+	local CurrentPos = plrHRP.Position
+	local Current939Pos = Primary.Position
+	return CurrentPos, Current939Pos
+end
+
+local function isInRadius(plr)
+	Ranges[plr] = Ranges[plr] or {}
+	local plrChar = plr.Character
+	if not plrChar then return end
+	local plrHRP = plrChar:FindFirstChild("HumanoidRootPart")
+	if not plrHRP then return end
+	local CurrentPos, Current939Pos = GetDistance(plr)
+	if not CurrentPos or not Current939Pos then return end
+	
+	local Dist = (CurrentPos - Current939Pos).Magnitude
+	print("Player Pos: ", CurrentPos)
+	print("939 Po: ", Current939Pos)
+	Ranges[plr].InRun = false
+	Ranges[plr].InCrouch = false
+	Ranges[plr].InWalk = false
+	Ranges[plr].InDeath = false -- reset variable each call
+	
+	if Dist <= Crouch2 then
+		print(plr.Name.. " is in death range.")
+		Ranges[plr].InRun = true
+		Ranges[plr].InCrouch = true
+		Ranges[plr].InWalk = true
+		Ranges[plr].InDeath = true
+	elseif Dist <= CrouchRadius then
+		print(plr.Name.. " is in crouch radius.")
+		Ranges[plr].InRun = true
+		Ranges[plr].InCrouch = true
+		Ranges[plr].InWalk = true
+	elseif Dist <= WalkRadius then
+		print(plr.Name.. " is in walk radius.")
+		Ranges[plr].InWalk = true
+		Ranges[plr].InRun = true
+	elseif Dist <= RunRadius then
+		print(plr.Name.. " is in run radius.")
+		Ranges[plr].InRun = true
+	end
+	return Dist
+end
+
+local function chooseTarget()
+	local bestPlr = nil
+	local bestDist = math.huge
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local dist = isInRadius(plr)
+		if dist and dist < bestDist then
+			bestPlr = plr
+			bestDist = dist
+		end
+	end
+
+	return bestPlr
+end
+
+local function CheckState(plr)
+	State[plr] = State[plr] or {}
+	if not plr then return end
+	if State[plr] == "Running" then
+		print(plr.Name.. " is running.")
+		isInRadius(plr)
+	elseif State[plr] == "Walking" then
+		print(plr.Name.. " is walking")
+		isInRadius(plr)
+	elseif State[plr] == "Crouching" then
+		print(plr.Name.. " is crouching.")
+		isInRadius(plr)
+	elseif State[plr] == "Standing" then
+		print(plr.Name.. " is standing") -- i understand this will run a lot, but its debug.
+		return
+	end
+end
+
+task.spawn(function()
+	while true do
+		if Breached then
+			for _, plr in ipairs(Players:GetPlayers()) do
+				isInRadius(plr)
+			end
+
+			local targ = chooseTarget()
+
+			if targ then
+				currentTarget = targ
+				Targetting = true
+				SmoothPathing(targ)
+				Targetting = false
+			else
+				currentTarget = nil
+				Targetting = false
+				PatrolWaypoints()
+			end
+		else
+		end
+
+		task.wait(Tick)
+	end
+end)
+
+Event.OnServerEvent:Connect(function(plr, state)
+	if not RateLimit(plr, 0.5) then return end
+	local plrChar = plr.Character
+	local plrHRP = plrChar:FindFirstChild("HumanoidRootPart")
+	if not plrChar or not plrHRP then return end
+	if (plrHRP.Position - Primary.Position).Magnitude > RunRadius then return end
+
+	if typeof(state) == "string" then
+		State[plr] = state
+	else
+		warn("Passed state is not a string.")
+	end
+	CheckState(plr)
+end)
+
+while true do -- temporary for breach event (prob gonna make breaches a module)
+	local Chance = math.random(1,3)
+	if Chance == 2 then
+		Breached = true
+		break
+	end
+	task.wait(5)
+end
+
+Players.PlayerAdded:Connect(function(plr)
+	State[plr] = nil
+	Ranges[plr] = nil
+end)
+
+Players.PlayerRemoving:Connect(function(plr)
+	State[plr] = nil
+	Ranges[plr] = nil
+end)
